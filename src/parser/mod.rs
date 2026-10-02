@@ -1,3 +1,5 @@
+pub mod dxf;
+
 use crate::core::geo::Shape;
 use std::path::Path;
 

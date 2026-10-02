@@ -234,6 +234,18 @@ impl SerialDriver {
         Ok(())
     }
 
+    /// Relative jog move (ESP301 `G0` with per-axis deltas, e.g. `G0x1.000y-0.500`)
+    pub fn jog_relative(&mut self, x: f64, y: f64, z: f64) -> Result<(), Error> {
+        let mut cmd = String::from("G0");
+        for (letter, v) in [('x', x), ('y', y), ('z', z)] {
+            if v != 0.0 {
+                cmd.push(letter);
+                cmd.push_str(&format!("{:.3}", v));
+            }
+        }
+        self.send(&cmd)
+    }
+
     /// Send motion buffer (batch of moves)
     pub fn buffer_move(
         &mut self,

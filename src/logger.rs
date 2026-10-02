@@ -1,13 +1,20 @@
 //! Logger module — structured logging with timestamps and git info.
+//!
+//! Console output comes from `env_logger`; the same lines are appended to a
+//! per-session file under the log directory. Installing happens once, on the
+//! first [`Logger::init`].
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use chrono::Local;
-use log::Level;
+use log::{Level, LevelFilter};
 use uuid::Uuid;
+
+/// Session log file, set by [`Logger::init`].
+static SINK: OnceLock<Mutex<File>> = OnceLock::new();
 
 /// A log entry with full context
 #[derive(Debug, Clone)]
@@ -31,59 +38,50 @@ impl std::fmt::Display for LogEntry {
 }
 
 /// The application logger singleton
+#[derive(Debug)]
 pub struct Logger {
     log_dir: PathBuf,
     session_id: String,
     git_commit: String,
-    file: Mutex<File>,
 }
 
 impl Logger {
-    /// Initialize the logger with a log directory
-    pub fn init(log_dir: PathBuf) -> Result<Self, std::io::Error> {
+    /// Initialize the logger with a log directory. File failures degrade to
+    /// console-only logging instead of taking the app down.
+    pub fn init(log_dir: PathBuf) -> Self {
         let session_id = Uuid::new_v4().to_string();
         let git_commit = Self::get_git_commit();
 
-        // Create log directory
-        std::fs::create_dir_all(&log_dir)?;
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            eprintln!("lithowrite: cannot create {}: {e}", log_dir.display());
+        }
 
-        // Create log file with timestamp
-        let now = Local::now();
-        let log_file_name = format!("{}.log", now.format("%Y%m%d_%H%M%S"));
-        let log_path = log_dir.join(&log_file_name);
-
-        let file = OpenOptions::new()
+        let path = log_dir.join(format!("{}.log", Local::now().format("%Y%m%d_%H%M%S")));
+        match OpenOptions::new()
             .create(true)
             .write(true)
-            .append(false)
-            .open(&log_path)?;
+            .truncate(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                let _ = SINK.set(Mutex::new(file));
+            }
+            Err(e) => eprintln!("lithowrite: cannot open {}: {e}", path.display()),
+        }
 
-        // Init env_logger for console/stderr
-        env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Info)
-            .format(|buf, record| {
-                let ts = Local::now().format("%H:%M:%S%.3f");
-                writeln!(
-                    buf,
-                    "{} [{}] {} {}",
-                    ts,
-                    record.level(),
-                    record.module_path().unwrap_or("unknown"),
-                    record.args()
-                )
-            })
-            .init();
+        let _ = env_logger::Builder::new()
+            .filter_level(LevelFilter::Info)
+            .format(emit)
+            .try_init();
 
-        Ok(Logger {
+        Logger {
             log_dir,
             session_id,
             git_commit,
-            file: Mutex::new(file),
-        })
+        }
     }
 
     fn get_git_commit() -> String {
-        // Fallback: git describe from env
         if let Ok(git) = std::process::Command::new("git")
             .args(&["rev-parse", "--short", "HEAD"])
             .output()
@@ -106,11 +104,31 @@ impl Logger {
     pub fn log_dir(&self) -> &PathBuf {
         &self.log_dir
     }
+}
 
-    fn log_to_file(&self, entry: &LogEntry) {
-        if let Ok(mut file) = self.file.lock() {
-            let _ = writeln!(file, "{}", entry);
-            let _ = file.flush();
-        }
+/// Console + file sink installed as the `log` crate backend.
+fn emit(buf: &mut env_logger::fmt::Formatter, record: &log::Record<'_>) -> std::io::Result<()> {
+    let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    writeln!(
+        buf,
+        "{} [{}] {} {}",
+        ts,
+        record.level(),
+        record.module_path().unwrap_or("-"),
+        record.args()
+    )?;
+
+    if let Some(file) = SINK.get()
+        && let Ok(mut f) = file.lock()
+    {
+        let _ = writeln!(
+            f,
+            "[{ts}] {} {} {}",
+            record.level(),
+            record.module_path().unwrap_or("-"),
+            record.args()
+        );
+        let _ = f.flush();
     }
+    Ok(())
 }

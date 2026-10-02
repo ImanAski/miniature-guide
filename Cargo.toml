@@ -39,3 +39,6 @@ git2 = "0.20"
 
 # Native file picker
 rfd = { version = "0.15", features = ["xdg-portal"] }
+
+# Parsers
+acadrust = "0.5.5"
