@@ -46,19 +46,20 @@ impl Slot {
         self,
         ctx: &Context,
         id: &'static str,
-        title: &str,
+        _title: &str,
         size: f32,
         body: impl FnOnce(&mut Ui),
     ) {
-        let collapsible = self.is_collapsible();
+        let _collapsible = self.is_collapsible();
         let wrap = move |ui: &mut Ui| {
-            if collapsible {
-                CollapsingHeader::new(RichText::new(title).strong())
-                    .id_salt(id)
-                    .show(ui, body);
-            } else {
-                body(ui);
-            }
+            body(ui);
+            // if collapsible {
+            //     CollapsingHeader::new(RichText::new(title).strong())
+            //         .id_salt(id)
+            //         .show(ui, body);
+            // } else {
+            //     body(ui);
+            // }
         };
         match self {
             Slot::Top => {
@@ -157,7 +158,7 @@ impl PanelRegistry {
         use panels::*;
         PanelRegistry::new()
             .with(MotionPanel::new())
-            .with(ConfigPanel::default())
+            // .with(ConfigPanel::default())
             .with(ViewportPanel::default())
             .with(LogPanel::default())
             .with(StatusPanel)

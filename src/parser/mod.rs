@@ -1,4 +1,5 @@
 pub mod dxf;
+// pub mod gds;
 
 use crate::core::geo::Shape;
 use std::path::Path;
@@ -34,6 +35,8 @@ pub fn parse_file(path: &Path) -> Result<Vec<Shape>, ParseError> {
         .unwrap_or_default();
 
     match ext.as_str() {
+        "dxf" => Ok(dxf::parse(path)?),
+        "gds" => Err(ParseError::UnsupportedFormat(ext)),
         _ => Err(ParseError::UnsupportedFormat(ext)),
     }
 }
@@ -43,6 +46,37 @@ pub enum ParseError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("DXF error: {0}")]
+    Dxf(#[from] acadrust::DxfError),
+
     #[error("UnsupportedFormat: {0}")]
     UnsupportedFormat(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatches_dxf_by_extension() {
+        let path = Path::new("tests/data/example.dxf");
+
+        let shapes = parse_file(path).expect("example.dxf should parse");
+
+        assert!(!shapes.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_extensions() {
+        let err = parse_file(Path::new("drawing.gcode")).expect_err("gcode is not supported yet");
+
+        assert!(matches!(err, ParseError::UnsupportedFormat(ext) if ext == "gcode"));
+    }
+
+    #[test]
+    fn reports_missing_extension() {
+        let err = parse_file(Path::new("drawing")).expect_err("no extension");
+
+        assert!(matches!(err, ParseError::UnsupportedFormat(ext) if ext.is_empty()));
+    }
 }
