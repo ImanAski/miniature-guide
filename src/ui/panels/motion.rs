@@ -8,6 +8,7 @@ use egui::{
     vec2,
 };
 
+use crate::app::AppStatus;
 use crate::core::geo::fmt_f;
 use crate::core::motion::{AXES, Axes, DriveMode};
 use crate::esp301::LinkConfig;
@@ -260,6 +261,7 @@ impl MotionPanel {
                 );
             }
             if ui.button("Go").clicked() {
+                self.cancel_follow(ctx);
                 let target = Axes::from_array(self.target_mm);
                 let msg = format!("move to {}", target);
                 match ctx.motion.move_to(target) {
@@ -301,6 +303,7 @@ impl MotionPanel {
     }
 
     fn jog(&mut self, ctx: &mut PanelCtx<'_>, axis: usize, direction: f64) {
+        self.cancel_follow(ctx);
         let step = self.step_mm;
         let feed = self.feed_mm_s;
         if let Err(e) = ctx.motion.jog(axis, direction, step, feed) {
@@ -319,17 +322,29 @@ impl MotionPanel {
                 }
             }
             if ui.button("Stop").clicked() {
+                self.cancel_follow(ctx);
                 let _ = ctx.motion.stop(false);
             }
             if ui.button("Ramp stop").clicked() {
+                self.cancel_follow(ctx);
                 let _ = ctx.motion.stop(true);
             }
             if ui.button("Reset sim").clicked() {
+                self.cancel_follow(ctx);
                 ctx.motion.sim.reset();
                 self.target_mm = [0.0; 3];
                 ctx.note(log::Level::Info, "motion", "simulator reset");
             }
         });
+    }
+
+    /// Abort an active path-follow run, e.g. when the operator takes over.
+    fn cancel_follow(&mut self, ctx: &mut PanelCtx<'_>) {
+        if ctx.runner.is_running() {
+            ctx.runner.stop();
+            *ctx.status = AppStatus::Ready;
+            ctx.note(log::Level::Info, "motion", "path follow stopped");
+        }
     }
 
     fn plot_section(&mut self, ui: &mut Ui, ctx: &mut PanelCtx<'_>) {
@@ -388,6 +403,7 @@ impl MotionPanel {
         {
             let wx = view.center.0 + (pointer.x - rect.center().x) as f64 / view.px_per_mm as f64;
             let wy = view.center.1 - (pointer.y - rect.center().y) as f64 / view.px_per_mm as f64;
+            self.cancel_follow(ctx);
             let target = Axes::new(wx, wy, pos.z);
             self.target_mm = target.to_array();
             if let Err(e) = ctx.motion.move_to(target) {

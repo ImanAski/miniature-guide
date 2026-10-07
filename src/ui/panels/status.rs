@@ -75,6 +75,13 @@ impl Panel for StatusPanel {
                     ui.colored_label(ui.visuals().error_fg_color, err);
                 }
                 ui.separator();
+                if !ctx.selection.is_empty() {
+                    ui.label(
+                        RichText::new(format!("{} selected", ctx.selection.len()))
+                            .small()
+                            .weak(),
+                    );
+                }
                 ui.label(
                     RichText::new(format!("{} shapes", ctx.shapes.len()))
                         .small()

@@ -505,6 +505,23 @@ impl Shape {
             layer: self.layer.clone(),
         }
     }
+
+    /// Flatten to a point ring (first point not repeated at the end),
+    /// dropping zero-length steps. Arcs are approximated within `tolerance`.
+    pub fn ring(&self, tolerance: f64) -> Vec<Point> {
+        let mut ring: Vec<Point> = Vec::new();
+        for elem in &self.elements {
+            for p in elem.approx_segments(tolerance) {
+                if ring.last().is_none_or(|l| l.distance(p) > 1e-9) {
+                    ring.push(p);
+                }
+            }
+        }
+        if ring.len() > 1 && ring.first() == ring.last() {
+            ring.pop();
+        }
+        ring
+    }
 }
 
 impl PathElement {
@@ -517,11 +534,8 @@ impl PathElement {
             PathElement::Arc(a) => {
                 // Arc transform: rotate center, keep radius, adjust angles
                 let new_center = t.transform_point(a.center);
-                let dir0 = (a.start() - a.center).normalize();
-                let dir1 = (a.end() - a.center).normalize();
-                let _transformed_dir0 = t.transform_vec(dir0);
-                let _transformed_dir1 = t.transform_vec(dir1);
-                let start_angle = (t.transform_point(a.start()) - new_center).angle_to(new_center);
+                // Angle is measured from the center toward the start point.
+                let start_angle = new_center.angle_to(t.transform_point(a.start()));
                 PathElement::Arc(Arc {
                     center: new_center,
                     radius: a.radius,

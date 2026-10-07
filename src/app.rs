@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::config::AppConfig;
 use crate::core::geo::Shape;
 use crate::core::motion::MotionHub;
+use crate::core::path::{PathEvent, PathRunner};
 use crate::logger::Logger;
 use crate::ui::buffer::LogBuffer;
 use crate::ui::{PanelCtx, PanelRegistry};
@@ -12,9 +14,14 @@ pub struct LithoApp {
     panels: PanelRegistry,
     config: AppConfig,
     motion: MotionHub,
+    runner: PathRunner,
     log: LogBuffer,
     status: AppStatus,
     shapes: Vec<Shape>,
+    /// Indices into `shapes`, shared by viewport and geometry tools.
+    selection: Vec<usize>,
+    /// Layer names hidden in the viewport.
+    hidden_layers: HashSet<String>,
 }
 
 impl LithoApp {
@@ -35,9 +42,12 @@ impl LithoApp {
             panels: PanelRegistry::standard(),
             config,
             motion,
+            runner: PathRunner::new(),
             log,
             status: AppStatus::Ready,
             shapes: Vec::new(),
+            selection: Vec::new(),
+            hidden_layers: HashSet::new(),
         };
 
         cc.egui_ctx.set_theme(match app.config.ui.theme {
@@ -69,7 +79,19 @@ impl LithoApp {
 impl eframe::App for LithoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.motion.tick();
-        if self.motion.is_moving() {
+        match self.runner.tick(&mut self.motion) {
+            Some(PathEvent::Finished { steps }) => {
+                self.log
+                    .info("path", format!("path follow finished ({steps} waypoints)"));
+                self.status = AppStatus::Done;
+            }
+            Some(PathEvent::Failed(e)) => {
+                self.log.error("path", format!("path follow failed: {e}"));
+                self.status = AppStatus::Error(e);
+            }
+            None => {}
+        }
+        if self.motion.is_moving() || self.runner.is_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
 
@@ -77,9 +99,12 @@ impl eframe::App for LithoApp {
             panels,
             config,
             motion,
+            runner,
             log,
             status,
             shapes,
+            selection,
+            hidden_layers,
             ..
         } = self;
 
@@ -92,6 +117,9 @@ impl eframe::App for LithoApp {
                 status,
                 log,
                 shapes,
+                runner,
+                selection,
+                hidden_layers,
             },
         );
     }

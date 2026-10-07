@@ -2,6 +2,7 @@
 
 use egui::{Color32, RichText, Sense, Stroke, pos2, vec2};
 
+use crate::app::AppStatus;
 use crate::core::geo::{PathElement, Point, Rect, Shape, fmt_f};
 use crate::ui::{Panel, PanelCtx, Slot};
 
@@ -15,7 +16,6 @@ pub struct ViewportPanel {
     zoom: f64,
     show_grid: bool,
     show_origin: bool,
-    selected: Option<usize>,
     fit_pending: bool,
 }
 
@@ -26,7 +26,6 @@ impl Default for ViewportPanel {
             zoom: 2.0,
             show_grid: true,
             show_origin: true,
-            selected: None,
             fit_pending: true,
         }
     }
@@ -83,7 +82,10 @@ impl Panel for ViewportPanel {
 
         let tolerance = ctx.config.processing.approximation_tolerance.max(1e-4);
         for (i, shape) in ctx.shapes.iter().enumerate() {
-            let selected = self.selected == Some(i);
+            if is_hidden(shape, ctx) {
+                continue;
+            }
+            let selected = ctx.selection.contains(&i);
             let color = if selected {
                 accent
             } else {
@@ -141,16 +143,18 @@ impl ViewportPanel {
                 self.fit_pending = true;
             }
             ui.separator();
+            self.follow_section(ui, ctx);
+            ui.separator();
             ui.checkbox(&mut self.show_grid, "grid");
             ui.checkbox(&mut self.show_origin, "origin");
             ui.separator();
+            let delete_enabled = !ctx.selection.is_empty();
             if ui
-                .add_enabled(self.selected.is_some(), egui::Button::new("Delete"))
+                .add_enabled(delete_enabled, egui::Button::new("Delete"))
+                .on_hover_text("remove every selected shape")
                 .clicked()
-                && let Some(i) = self.selected.take()
-                && i < ctx.shapes.len()
             {
-                ctx.shapes.remove(i);
+                self.delete_selection(ctx);
             }
             ui.separator();
             ui.label(
@@ -168,6 +172,51 @@ impl ViewportPanel {
                 .weak(),
             );
         });
+    }
+
+    fn follow_section(&mut self, ui: &mut egui::Ui, ctx: &mut PanelCtx<'_>) {
+        if ctx.runner.is_running() {
+            let (done, total) = ctx.runner.progress();
+            ui.label(RichText::new(format!("follow {done}/{total}")).small());
+            if ui.button("Stop path").clicked() {
+                ctx.runner.stop();
+                *ctx.status = AppStatus::Ready;
+                ctx.note(log::Level::Info, "viewport", "path follow stopped");
+            }
+            return;
+        }
+        let has_geometry = !ctx.shapes.is_empty();
+        if ui
+            .add_enabled(has_geometry, egui::Button::new("Follow path"))
+            .on_disabled_hover_text("load a DXF or add demo geometry first")
+            .clicked()
+        {
+            self.follow(ctx);
+        }
+    }
+
+    fn follow(&mut self, ctx: &mut PanelCtx<'_>) {
+        let z = ctx.motion.pos().z;
+        let tolerance = ctx.config.processing.approximation_tolerance;
+        let limits = ctx.motion.sim.limits;
+        // Hidden layers are not exposed by the machine.
+        let visible: Vec<Shape> = ctx
+            .shapes
+            .iter()
+            .filter(|s| !is_hidden(s, ctx))
+            .cloned()
+            .collect();
+        match ctx.runner.start(&visible, z, tolerance, &limits) {
+            Ok(steps) => {
+                *ctx.status = AppStatus::Running;
+                ctx.note(
+                    log::Level::Info,
+                    "viewport",
+                    format!("path follow started ({steps} waypoints)"),
+                );
+            }
+            Err(e) => ctx.note(log::Level::Error, "viewport", format!("path follow: {e}")),
+        }
     }
 
     fn open(&mut self, ctx: &mut PanelCtx<'_>) {
@@ -192,7 +241,7 @@ impl ViewportPanel {
         ui: &egui::Ui,
         resp: &egui::Response,
         rect: egui::Rect,
-        ctx: &PanelCtx<'_>,
+        ctx: &mut PanelCtx<'_>,
     ) {
         if resp.dragged() {
             let d = resp.drag_delta();
@@ -211,7 +260,35 @@ impl ViewportPanel {
             && let Some(pos) = resp.interact_pointer_pos()
         {
             let world = self.to_world(pos, rect);
-            self.selected = pick(ctx.shapes, world);
+            let hit = pick(ctx.shapes, ctx, world);
+            let additive = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl);
+            if additive {
+                if let Some(i) = hit {
+                    toggle(ctx.selection, i);
+                }
+            } else {
+                ctx.selection.clear();
+                if let Some(i) = hit {
+                    ctx.selection.push(i);
+                }
+            }
+        }
+    }
+
+    /// Remove every selected shape (indices descending so positions stay valid).
+    fn delete_selection(&mut self, ctx: &mut PanelCtx<'_>) {
+        let mut idxs = ctx.selection.clone();
+        idxs.sort_unstable();
+        idxs.dedup();
+        let n = idxs.len();
+        for &i in idxs.iter().rev() {
+            if i < ctx.shapes.len() {
+                ctx.shapes.remove(i);
+            }
+        }
+        ctx.selection.clear();
+        if n > 0 {
+            ctx.note(log::Level::Info, "viewport", format!("deleted {n} shapes"));
         }
     }
 
@@ -292,7 +369,34 @@ impl ViewportPanel {
 
     fn info_line(&self, ctx: &PanelCtx<'_>) -> String {
         let total: f64 = ctx.shapes.iter().map(|s| s.total_length()).sum();
-        format!("{} shapes · {:.1} mm path", ctx.shapes.len(), total)
+        let selected = if ctx.selection.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} selected", ctx.selection.len())
+        };
+        format!(
+            "{} shapes{} · {:.1} mm path",
+            ctx.shapes.len(),
+            selected,
+            total
+        )
+    }
+}
+
+/// Whether a shape's layer is currently hidden.
+fn is_hidden(shape: &Shape, ctx: &PanelCtx<'_>) -> bool {
+    shape
+        .layer
+        .as_ref()
+        .is_some_and(|l| ctx.hidden_layers.contains(l))
+}
+
+fn toggle(selection: &mut Vec<usize>, i: usize) {
+    match selection.iter().position(|&x| x == i) {
+        Some(pos) => {
+            selection.remove(pos);
+        }
+        None => selection.push(i),
     }
 }
 
@@ -300,11 +404,11 @@ fn ctx_repaint(ui: &egui::Ui) {
     ui.ctx().request_repaint();
 }
 
-fn pick(shapes: &[Shape], world: Point) -> Option<usize> {
+fn pick(shapes: &[Shape], ctx: &PanelCtx<'_>, world: Point) -> Option<usize> {
     shapes
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.bounds().is_some_and(|b| b.contains(world)))
+        .filter(|(_, s)| !is_hidden(s, ctx) && s.bounds().is_some_and(|b| b.contains(world)))
         .map(|(i, _)| i)
         .next_back()
 }

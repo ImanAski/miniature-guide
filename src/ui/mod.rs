@@ -20,6 +20,7 @@ use egui::{CollapsingHeader, Context, RichText, Ui};
 use crate::app::AppStatus;
 use crate::config::AppConfig;
 use crate::core::motion::MotionHub;
+use crate::core::path::PathRunner;
 
 use buffer::LogBuffer;
 
@@ -104,6 +105,11 @@ pub struct PanelCtx<'a> {
     pub status: &'a mut AppStatus,
     pub log: &'a mut LogBuffer,
     pub shapes: &'a mut Vec<crate::core::geo::Shape>,
+    pub runner: &'a mut PathRunner,
+    /// Selected shape indices (shared between viewport and geometry tools).
+    pub selection: &'a mut Vec<usize>,
+    /// Layer names hidden in the viewport.
+    pub hidden_layers: &'a mut std::collections::HashSet<String>,
 }
 
 impl PanelCtx<'_> {
@@ -160,6 +166,7 @@ impl PanelRegistry {
             .with(MotionPanel::new())
             // .with(ConfigPanel::default())
             .with(ViewportPanel::default())
+            .with(GeometryPanel::new())
             .with(LogPanel::default())
             .with(StatusPanel)
     }
@@ -242,6 +249,9 @@ mod tests {
                 log.info("test", "frame");
                 let mut status = AppStatus::Ready;
                 let mut shapes = Vec::new();
+                let mut runner = PathRunner::new();
+                let mut selection = Vec::new();
+                let mut hidden_layers = std::collections::HashSet::new();
 
                 let mut registry = PanelRegistry::standard();
                 let mut pctx = PanelCtx {
@@ -251,6 +261,9 @@ mod tests {
                     status: &mut status,
                     log: &mut log,
                     shapes: &mut shapes,
+                    runner: &mut runner,
+                    selection: &mut selection,
+                    hidden_layers: &mut hidden_layers,
                 };
                 registry.render(ctx, &mut pctx);
             });
