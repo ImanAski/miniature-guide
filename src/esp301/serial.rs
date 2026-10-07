@@ -93,6 +93,11 @@ impl SerialDriver {
         })
     }
 
+    /// Port identifier this driver was opened on (for logs/status).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Send a raw command string (with CR terminator)
     pub fn send(&mut self, cmd: &str) -> Result<(), Error> {
         let full = format!("{}\r", cmd);

@@ -15,7 +15,7 @@
 pub mod buffer;
 pub mod panels;
 
-use egui::{CollapsingHeader, Context, RichText, Ui};
+use egui::{Context, Ui};
 
 use crate::app::AppStatus;
 use crate::config::AppConfig;
@@ -123,6 +123,9 @@ pub struct PanelCtx<'a> {
     pub selection: &'a mut Vec<usize>,
     /// Layer names hidden in the viewport.
     pub hidden_layers: &'a mut std::collections::HashSet<String>,
+    /// Last computed write plan (`None` until the user asks for one).
+    /// Set by the planner panel, overlaid by the viewport, cleared on edits.
+    pub plan: &'a mut Option<crate::hybrid::Plan>,
 }
 
 impl PanelCtx<'_> {
@@ -180,6 +183,7 @@ impl PanelRegistry {
             // .with(ConfigPanel::default())
             .with(ViewportPanel::default())
             .with(GeometryPanel::new())
+            .with(PlannerPanel::default())
             .with(LogPanel::default())
             .with(StatusPanel)
     }
@@ -238,7 +242,7 @@ mod tests {
     #[test]
     fn standard_registry_has_unique_ids() {
         let mut reg = PanelRegistry::standard();
-        assert_eq!(reg.len(), 5);
+        assert_eq!(reg.len(), 6);
         let mut ids: Vec<&str> = reg.iter().map(|p| p.id()).collect();
         ids.sort_unstable();
         let unique = ids.len();
@@ -274,6 +278,7 @@ mod tests {
                 let mut runner = PathRunner::new();
                 let mut selection = Vec::new();
                 let mut hidden_layers = std::collections::HashSet::new();
+                let mut plan: Option<crate::hybrid::Plan> = None;
 
                 let mut registry = PanelRegistry::standard();
                 let mut pctx = PanelCtx {
@@ -286,6 +291,7 @@ mod tests {
                     runner: &mut runner,
                     selection: &mut selection,
                     hidden_layers: &mut hidden_layers,
+                    plan: &mut plan,
                 };
                 registry.render(ctx, &mut pctx);
             });

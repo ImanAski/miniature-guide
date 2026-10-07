@@ -15,6 +15,9 @@ pub struct AppConfig {
     pub controller: ControllerConfig,
     pub laser: LaserConfig,
     pub processing: ProcessingConfig,
+    /// Hybrid raster/vector write planner (absent from older config files).
+    #[serde(default)]
+    pub planner: PlannerConfig,
     pub ui: UiConfig,
     pub file: FileConfig,
 }
@@ -125,6 +128,258 @@ impl Default for ProcessingConfig {
     }
 }
 
+// ─── Hybrid write planner ────────────────────────────────────────────
+
+/// Parameters of the hybrid raster/vector write planner.
+///
+/// Unit convention matches the rest of the app: lengths in **mm**, speeds in
+/// **mm/s**, accelerations in **mm/s²**, times in **s**. The example values in
+/// `TASKS.md` are written in µm — divide them by 1000 (or 1e6 for areas) to
+/// compare. Nothing here is hard-coded elsewhere: the planner reads only what
+/// is stored in this struct, so changing machine parameters changes decisions.
+///
+/// Missing sections/keys fall back to [`Default`] (`#[serde(default)]`), so
+/// config files written before the planner existed still load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlannerConfig {
+    pub raster: RasterConfig,
+    pub vector: VectorConfig,
+    pub stage: StageConfig,
+    pub beam: BeamConfig,
+    /// Spatial tiling grid size (mm). The grid is aligned to multiples of
+    /// this value, so tiles are reproducible for a given layout.
+    pub tile_size_mm: f64,
+    /// Hard cap on tile count: the tile size doubles until the layout fits,
+    /// so tiny tile sizes cannot explode into millions of empty tiles.
+    pub max_tiles: usize,
+    /// Weight of write time in the cost function.
+    pub alpha: f64,
+    /// Weight of dose (dose uniformity) error.
+    pub beta: f64,
+    /// Weight of positioning error.
+    pub gamma: f64,
+    /// Weight of stage/beam jumps (travels between independent strokes).
+    pub delta: f64,
+    /// Weight of acceleration events (direction changes / line turns).
+    pub epsilon: f64,
+    /// Maximum tolerated scanline dose ripple (0..1). Raster (and the raster
+    /// part of hybrid) is rejected when the modelled ripple exceeds this.
+    pub dose_tolerance: f64,
+}
+
+/// Raster writer parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RasterConfig {
+    /// Distance between scan lines (mm).
+    pub pitch_mm: f64,
+    /// Exposure scan speed (mm/s), clamped to the stage's max velocity.
+    pub speed_mm_s: f64,
+    /// Minimum time to return to the start of the next line (s).
+    pub flyback_s: f64,
+    /// Scan every line in the same direction (false) or both directions (true).
+    pub bidirectional: bool,
+    /// Travel beyond both span ends so the speed is constant while the beam
+    /// is on (mm).
+    pub overscan_mm: f64,
+    /// One-off overhead each time a raster write starts (s).
+    pub setup_s: f64,
+}
+
+impl Default for RasterConfig {
+    fn default() -> Self {
+        RasterConfig {
+            pitch_mm: 0.0005, // 0.5 µm
+            speed_mm_s: 1.0,  // 1000 µm/s
+            flyback_s: 0.001, // 1 ms
+            bidirectional: true,
+            overscan_mm: 0.002, // 2 µm
+            setup_s: 0.05,      // 50 ms
+        }
+    }
+}
+
+/// Vector writer parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VectorConfig {
+    /// Contour/fill stroke speed (mm/s), clamped to the stage's max velocity.
+    pub write_speed_mm_s: f64,
+    /// Beam-off repositioning speed (mm/s), clamped to the stage's max velocity.
+    pub jump_speed_mm_s: f64,
+    /// Time lost at each corner of a vector path (s).
+    pub corner_time_s: f64,
+    /// Fixed overhead of each jump between independent strokes (s).
+    pub jump_time_s: f64,
+}
+
+impl Default for VectorConfig {
+    fn default() -> Self {
+        VectorConfig {
+            write_speed_mm_s: 0.5, // 500 µm/s
+            jump_speed_mm_s: 5.0,  // 5000 µm/s
+            corner_time_s: 0.0001, // 0.1 ms
+            jump_time_s: 0.001,    // 1 ms
+        }
+    }
+}
+
+/// Motion-stage limits used by the travel-time model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StageConfig {
+    /// Maximum stage velocity (mm/s).
+    pub max_velocity_mm_s: f64,
+    /// Maximum stage acceleration (mm/s²) — drives the short-move penalty.
+    pub max_acceleration_mm_s2: f64,
+    /// Settling time after each direction change (s).
+    pub settling_time_s: f64,
+}
+
+impl Default for StageConfig {
+    fn default() -> Self {
+        StageConfig {
+            max_velocity_mm_s: 10.0,      // 10 mm/s = 10 000 µm/s
+            max_acceleration_mm_s2: 50.0, // 50 mm/s² = 50 000 µm/s²
+            settling_time_s: 0.0005,      // 0.5 ms
+        }
+    }
+}
+
+/// Beam parameters: what the optics can actually resolve.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BeamConfig {
+    /// Beam spot diameter (mm): strokes of about this width expose features.
+    pub spot_size_mm: f64,
+    /// Smallest feature raster mode may attempt (mm). Regions containing
+    /// narrower features are written vectorially instead.
+    pub minimum_feature_mm: f64,
+}
+
+impl Default for BeamConfig {
+    fn default() -> Self {
+        BeamConfig {
+            spot_size_mm: 0.001,        // 1 µm
+            minimum_feature_mm: 0.0008, // 0.8 µm
+        }
+    }
+}
+
+impl Default for PlannerConfig {
+    fn default() -> Self {
+        PlannerConfig {
+            raster: RasterConfig::default(),
+            vector: VectorConfig::default(),
+            stage: StageConfig::default(),
+            beam: BeamConfig::default(),
+            tile_size_mm: 0.1, // 100 µm
+            max_tiles: 4096,
+            alpha: 1.0,
+            beta: 10.0,
+            gamma: 10.0,
+            delta: 0.5,
+            epsilon: 0.5,
+            dose_tolerance: 0.1,
+        }
+    }
+}
+
+impl PlannerConfig {
+    /// Reject parameter sets the cost model cannot evaluate sanely.
+    /// Every message names the offending field so the config file can be fixed.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut errs: Vec<String> = Vec::new();
+        let pos = |name: &str, v: f64, errs: &mut Vec<String>| {
+            if !(v.is_finite() && v > 0.0) {
+                errs.push(format!("{name} must be > 0 (got {v})"));
+            }
+        };
+        pos("planner.tile_size_mm", self.tile_size_mm, &mut errs);
+        pos("planner.raster.pitch_mm", self.raster.pitch_mm, &mut errs);
+        pos(
+            "planner.raster.speed_mm_s",
+            self.raster.speed_mm_s,
+            &mut errs,
+        );
+        pos(
+            "planner.raster.overscan_mm",
+            self.raster.overscan_mm,
+            &mut errs,
+        );
+        pos("planner.raster.setup_s", self.raster.setup_s, &mut errs);
+        pos(
+            "planner.vector.write_speed_mm_s",
+            self.vector.write_speed_mm_s,
+            &mut errs,
+        );
+        pos(
+            "planner.vector.jump_speed_mm_s",
+            self.vector.jump_speed_mm_s,
+            &mut errs,
+        );
+        pos(
+            "planner.stage.max_velocity_mm_s",
+            self.stage.max_velocity_mm_s,
+            &mut errs,
+        );
+        pos(
+            "planner.stage.max_acceleration_mm_s2",
+            self.stage.max_acceleration_mm_s2,
+            &mut errs,
+        );
+        pos(
+            "planner.beam.spot_size_mm",
+            self.beam.spot_size_mm,
+            &mut errs,
+        );
+        pos(
+            "planner.beam.minimum_feature_mm",
+            self.beam.minimum_feature_mm,
+            &mut errs,
+        );
+        if !(self.raster.flyback_s >= 0.0 && self.raster.flyback_s.is_finite()) {
+            errs.push(format!(
+                "planner.raster.flyback_s must be >= 0 (got {})",
+                self.raster.flyback_s
+            ));
+        }
+        if !(self.vector.corner_time_s >= 0.0 && self.vector.corner_time_s.is_finite()) {
+            errs.push(format!(
+                "planner.vector.corner_time_s must be >= 0 (got {})",
+                self.vector.corner_time_s
+            ));
+        }
+        if !(self.vector.jump_time_s >= 0.0 && self.vector.jump_time_s.is_finite()) {
+            errs.push(format!(
+                "planner.vector.jump_time_s must be >= 0 (got {})",
+                self.vector.jump_time_s
+            ));
+        }
+        if !(self.stage.settling_time_s >= 0.0 && self.stage.settling_time_s.is_finite()) {
+            errs.push(format!(
+                "planner.stage.settling_time_s must be >= 0 (got {})",
+                self.stage.settling_time_s
+            ));
+        }
+        if !(self.dose_tolerance.is_finite() && self.dose_tolerance > 0.0) {
+            errs.push(format!(
+                "planner.dose_tolerance must be > 0 (got {})",
+                self.dose_tolerance
+            ));
+        }
+        if self.max_tiles == 0 {
+            errs.push("planner.max_tiles must be >= 1".to_string());
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(errs.join("; "))
+        }
+    }
+}
+
 /// UI configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
@@ -182,6 +437,7 @@ impl Default for AppConfig {
             controller: ControllerConfig::default(),
             laser: LaserConfig::default(),
             processing: ProcessingConfig::default(),
+            planner: PlannerConfig::default(),
             ui: UiConfig::default(),
             file: FileConfig::default(),
         }

@@ -4,6 +4,8 @@ use egui::{Color32, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::app::AppStatus;
 use crate::core::geo::{PathElement, Point, Rect, Shape, fmt_f};
+use crate::hybrid::WriteMode;
+use crate::ui::panels::mode_color;
 use crate::ui::{Panel, PanelCtx, Slot, toggle_selection};
 
 const MIN_ZOOM: f64 = 0.01;
@@ -11,6 +13,10 @@ const MAX_ZOOM: f64 = 400.0;
 /// Click tolerance: how near (px) the pointer must be to a shape's geometry
 /// for it to count as a hit.
 const HIT_PX: f64 = 6.0;
+/// Global cap on toolpath line segments drawn per frame. At production
+/// pitches (sub-micron) a full plan is millions of rows; the overlay
+/// subsamples to stay interactive and shows every tile's tint regardless.
+const PLAN_DRAW_BUDGET: usize = 6000;
 
 pub struct ViewportPanel {
     /// World point held at the canvas centre (mm).
@@ -19,6 +25,8 @@ pub struct ViewportPanel {
     zoom: f64,
     show_grid: bool,
     show_origin: bool,
+    /// Overlay the write plan (tile tints + toolpaths) when one exists.
+    show_plan: bool,
     fit_pending: bool,
 }
 
@@ -29,6 +37,7 @@ impl Default for ViewportPanel {
             zoom: 2.0,
             show_grid: true,
             show_origin: true,
+            show_plan: true,
             fit_pending: true,
         }
     }
@@ -120,6 +129,10 @@ impl Panel for ViewportPanel {
             self.fit_to_shapes(ctx, rect.size());
         }
 
+        if self.show_plan {
+            self.draw_plan(&painter, rect, ctx, ui);
+        }
+
         let info = self.info_line(ctx);
         painter.text(
             rect.left_top() + vec2(8.0, 6.0),
@@ -150,6 +163,12 @@ impl ViewportPanel {
             ui.separator();
             ui.checkbox(&mut self.show_grid, "grid");
             ui.checkbox(&mut self.show_origin, "origin");
+            let plan_on = ctx.plan.is_some();
+            ui.add_enabled_ui(plan_on, |ui| {
+                ui.checkbox(&mut self.show_plan, "plan");
+            })
+            .response
+            .on_disabled_hover_text("create a plan in the Plan panel first");
             ui.separator();
             let delete_enabled = !ctx.selection.is_empty();
             if ui
@@ -351,6 +370,113 @@ impl ViewportPanel {
             );
             y += step;
         }
+    }
+
+    /// Overlay the write plan: every tile tinted by its selected mode (the
+    /// decision map), then the toolpaths the selected mode will actually run.
+    ///
+    /// Tile tints are always drawn in full — they *are* the report. Toolpaths
+    /// are subsampled to [`PLAN_DRAW_BUDGET`] segments because a production
+    /// pitch (sub-micron) means millions of scan rows; the preview shows the
+    /// pattern, the exported SVG/report shows the exact paths.
+    fn draw_plan(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        ctx: &PanelCtx<'_>,
+        ui: &egui::Ui,
+    ) {
+        let Some(plan) = ctx.plan.as_ref() else {
+            return;
+        };
+
+        // 1. Tile tints (decision map): mode colour, light fill + stroke.
+        for tp in &plan.tiles {
+            let c = mode_color(tp.mode);
+            let b = tp.tile.bounds;
+            let p0 = self.to_screen(Point::new(b.min.x, b.max.y), rect);
+            let p1 = self.to_screen(Point::new(b.max.x, b.min.y), rect);
+            let r = egui::Rect::from_min_max(p0, p1);
+            if !r.intersects(rect) {
+                continue; // off-screen
+            }
+            let fill = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 26);
+            let edge = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110);
+            painter.rect_filled(r, 0.0, fill);
+            painter.rect_stroke(r, 0.0, Stroke::new(0.7_f32, edge), egui::StrokeKind::Middle);
+        }
+
+        // 2. Toolpaths, subsampled to the global budget.
+        let total_segments: usize = plan
+            .tiles
+            .iter()
+            .flat_map(|tp| tp.strokes.iter().map(|s| s.points.len().saturating_sub(1)))
+            .sum::<usize>()
+            + plan
+                .tiles
+                .iter()
+                .flat_map(|tp| tp.raster_lines.iter().map(|l| l.spans.len()))
+                .sum::<usize>();
+        let stride = (total_segments.div_ceil(PLAN_DRAW_BUDGET)).max(1);
+
+        for tp in &plan.tiles {
+            let c = mode_color(tp.mode);
+            let col = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 200);
+            let stroke = Stroke::new(1.0_f32, col);
+
+            for s in &tp.strokes {
+                let pts = &s.points;
+                for i in (0..pts.len().saturating_sub(1)).step_by(stride) {
+                    let a = self.to_screen(pts[i], rect);
+                    let b = self.to_screen(pts[i + 1], rect);
+                    painter.line_segment([a, b], stroke);
+                }
+                if s.closed && pts.len() > 2 {
+                    let a = self.to_screen(*pts.last().expect("checked"), rect);
+                    let b = self.to_screen(pts[0], rect);
+                    painter.line_segment([a, b], stroke);
+                }
+            }
+            for line in &tp.raster_lines {
+                for (x0, x1) in &line.spans {
+                    let a = self.to_screen(Point::new(*x0, line.y), rect);
+                    let b = self.to_screen(Point::new(*x1, line.y), rect);
+                    painter.line_segment([a, b], stroke);
+                }
+            }
+        }
+
+        // 3. Legend, bottom-left: mode counts + totals.
+        let [v, r, h] = plan.mode_counts();
+        let legend_y = rect.bottom() - 10.0;
+        let mut x = rect.left() + 8.0;
+        for (mode, n) in [
+            (WriteMode::Vector, v),
+            (WriteMode::Raster, r),
+            (WriteMode::Hybrid, h),
+        ] {
+            let c = mode_color(mode);
+            painter.rect_filled(
+                egui::Rect::from_min_size(pos2(x, legend_y - 6.0), vec2(9.0, 9.0)),
+                1.0,
+                c,
+            );
+            painter.text(
+                pos2(x + 12.0, legend_y - 7.0),
+                egui::Align2::LEFT_TOP,
+                format!("{n} {}", mode.label()),
+                egui::TextStyle::Small.resolve(ui.style()),
+                c,
+            );
+            x += 96.0;
+        }
+        painter.text(
+            pos2(x + 4.0, legend_y - 7.0),
+            egui::Align2::LEFT_TOP,
+            format!("est {:.3} s · cost {:.2}", plan.total_time, plan.total_cost),
+            egui::TextStyle::Small.resolve(ui.style()),
+            ui.visuals().weak_text_color(),
+        );
     }
 
     fn fit_to_shapes(&mut self, ctx: &PanelCtx<'_>, avail: egui::Vec2) {

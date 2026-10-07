@@ -22,6 +22,8 @@ pub struct LithoApp {
     selection: Vec<usize>,
     /// Layer names hidden in the viewport.
     hidden_layers: HashSet<String>,
+    /// Last computed write plan (planner panel sets, viewport overlays).
+    plan: Option<crate::hybrid::Plan>,
 }
 
 impl LithoApp {
@@ -48,6 +50,7 @@ impl LithoApp {
             shapes: Vec::new(),
             selection: Vec::new(),
             hidden_layers: HashSet::new(),
+            plan: None,
         };
 
         cc.egui_ctx.set_theme(match app.config.ui.theme {
@@ -105,6 +108,7 @@ impl eframe::App for LithoApp {
             shapes,
             selection,
             hidden_layers,
+            plan,
             ..
         } = self;
 
@@ -120,6 +124,7 @@ impl eframe::App for LithoApp {
                 runner,
                 selection,
                 hidden_layers,
+                plan,
             },
         );
     }

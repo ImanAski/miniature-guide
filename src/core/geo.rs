@@ -648,14 +648,6 @@ impl Point3D {
     pub fn new(x: f64, y: f64, z: f64) -> Self {
         Point3D { x, y, z }
     }
-
-    fn to_2d(self) -> Point {
-        Point::new(self.x, self.y)
-    }
-
-    fn from_2d(p: Point, z: f64) -> Self {
-        Point3D { x: p.x, y: p.y, z }
-    }
 }
 
 /// Transform a 3D point by the orbit camera
