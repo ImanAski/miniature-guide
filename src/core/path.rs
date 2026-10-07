@@ -4,9 +4,13 @@
 //! commands them one at a time through [`MotionHub`]: command the next point,
 //! wait until the stage is idle, skip the points it reached, repeat.
 //!
-//! Beam discipline: when started with `fire`, the laser is switched on with
-//! the first commanded waypoint and every way out of a run (finish, failure,
-//! [`PathRunner::stop`]) switches it back off.
+//! Beam discipline: each waypoint knows whether the leg *ending* at it is
+//! part of a shape's outline ([`Waypoint::expose`]) or a travel move — the
+//! approach to the first shape and the transition between two shapes stay
+//! dark. When started with `fire`, the laser switches on for exposing legs
+//! and off again for travels; every way out of a run (finish, failure,
+//! [`PathRunner::stop`]) leaves the beam off. An operator who kills the beam
+//! mid-run keeps it off for the rest of the run.
 
 use std::time::{Duration, Instant};
 
@@ -30,10 +34,20 @@ pub enum PathEvent {
     Failed(String),
 }
 
+/// One commanded position plus the exposure flag of the leg leading to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Waypoint {
+    pub pos: Axes,
+    /// `true` when this leg traces a shape's outline; `false` for the
+    /// approach to a shape's first point (which includes the transition
+    /// between two shapes — those legs must stay dark).
+    pub expose: bool,
+}
+
 /// Sequential waypoint walker over a flattened copy of the loaded shapes.
 #[derive(Debug)]
 pub struct PathRunner {
-    waypoints: Vec<Axes>,
+    waypoints: Vec<Waypoint>,
     index: usize,
     running: bool,
     commanded: bool,
@@ -41,9 +55,10 @@ pub struct PathRunner {
     grace: Duration,
     /// Fire the laser while the run is live.
     fire: bool,
-    /// The beam has been armed for this run (set once, so an operator
-    /// switching it off mid-run keeps control).
-    armed: bool,
+    /// The runner's last commanded beam state for this run.
+    beam: bool,
+    /// The operator switched the beam off mid-run: never re-fire this run.
+    operator_off: bool,
 }
 
 impl Default for PathRunner {
@@ -56,7 +71,8 @@ impl Default for PathRunner {
             commanded_at: None,
             grace: UNREACH_GRACE,
             fire: false,
-            armed: false,
+            beam: false,
+            operator_off: false,
         }
     }
 }
@@ -79,8 +95,8 @@ impl PathRunner {
     /// following them. Returns the waypoint count. Refuses geometry outside
     /// `limits` so the user gets the full bounds report up front.
     ///
-    /// `fire` arms the laser on the first commanded waypoint; every run end
-    /// switches the beam off again.
+    /// `fire` arms the laser on exposing legs (travels stay dark); every run
+    /// end switches the beam off again.
     pub fn start(
         &mut self,
         shapes: &[Shape],
@@ -96,7 +112,8 @@ impl PathRunner {
         if waypoints.is_empty() {
             return Err("path has no segments".to_string());
         }
-        check_limits(&waypoints, limits)?;
+        let positions: Vec<Axes> = waypoints.iter().map(|w| w.pos).collect();
+        check_limits(&positions, limits)?;
         let steps = waypoints.len();
         self.waypoints = waypoints;
         self.index = 0;
@@ -104,7 +121,8 @@ impl PathRunner {
         self.commanded = false;
         self.commanded_at = None;
         self.fire = fire;
-        self.armed = false;
+        self.beam = false;
+        self.operator_off = false;
         Ok(steps)
     }
 
@@ -116,6 +134,7 @@ impl PathRunner {
         self.running = false;
         self.commanded = false;
         self.commanded_at = None;
+        self.beam = false;
         if was_running {
             let _ = hub.set_laser(false);
         }
@@ -132,7 +151,7 @@ impl PathRunner {
         let pos = hub.pos();
         let mut advanced = false;
         while let Some(wp) = self.waypoints.get(self.index)
-            && pos.distance_to(*wp) <= REACH_TOL
+            && pos.distance_to(wp.pos) <= REACH_TOL
         {
             self.index += 1;
             advanced = true;
@@ -155,7 +174,7 @@ impl PathRunner {
             if !waited {
                 return None;
             }
-            let wp = self.waypoints[self.index];
+            let wp = self.waypoints[self.index].pos;
             let lim = hub.sim.limits;
             self.stop(hub);
             return Some(PathEvent::Failed(format!(
@@ -170,16 +189,28 @@ impl PathRunner {
             )));
         }
 
-        let wp = self.waypoints[self.index];
-        // Arm the beam before the stage starts moving (the stage is idle here).
-        if self.fire && !self.armed {
-            if let Err(e) = hub.set_laser(true) {
-                self.stop(hub);
-                return Some(PathEvent::Failed(format!("laser on failed: {e}")));
+        let leg = self.waypoints[self.index];
+        // Manage the beam while the stage is still idle, before it moves.
+        if self.fire {
+            if leg.expose {
+                if !self.beam && !self.operator_off {
+                    if let Err(e) = hub.set_laser(true) {
+                        self.stop(hub);
+                        return Some(PathEvent::Failed(format!("laser on failed: {e}")));
+                    }
+                    self.beam = true;
+                }
+            } else if self.beam {
+                // Travel leg: go dark. If the beam is already off although we
+                // commanded it on, the operator killed it — respect that.
+                if !hub.laser_on() {
+                    self.operator_off = true;
+                }
+                let _ = hub.set_laser(false);
+                self.beam = false;
             }
-            self.armed = true;
         }
-        match hub.move_to(wp) {
+        match hub.move_to(leg.pos) {
             Ok(()) => {
                 self.commanded = true;
                 self.commanded_at = Some(Instant::now());
@@ -194,15 +225,24 @@ impl PathRunner {
 }
 
 /// Flatten shapes into a waypoint list at height `z`, dropping segments
-/// shorter than [`MIN_WP_GAP`].
-fn build_waypoints(shapes: &[Shape], z: f64, tolerance: f64) -> Vec<Axes> {
-    let mut out: Vec<Axes> = Vec::new();
+/// shorter than [`MIN_WP_GAP`]. The leg into each shape's first point is
+/// flagged as travel so approaches and inter-shape transitions stay dark.
+fn build_waypoints(shapes: &[Shape], z: f64, tolerance: f64) -> Vec<Waypoint> {
+    let mut out: Vec<Waypoint> = Vec::new();
     for shape in shapes {
+        let mut placed = false;
         for elem in &shape.elements {
             for p in elem.approx_segments(tolerance) {
-                let wp = Axes::new(p.x, p.y, z);
-                if out.last().is_none_or(|l| l.distance_to(wp) > MIN_WP_GAP) {
-                    out.push(wp);
+                let pos = Axes::new(p.x, p.y, z);
+                if out
+                    .last()
+                    .is_none_or(|l| l.pos.distance_to(pos) > MIN_WP_GAP)
+                {
+                    out.push(Waypoint {
+                        pos,
+                        expose: placed,
+                    });
+                    placed = true;
                 }
             }
         }
@@ -410,6 +450,82 @@ mod tests {
         let ev = run(runner, &mut hub, 100_000);
         assert_eq!(ev, Some(PathEvent::Finished { steps: 2 }));
         assert!(!hub.laser_on(), "beam dies when the run finishes");
+    }
+
+    #[test]
+    fn transitions_between_shapes_stay_dark() {
+        let mut hub = MotionHub::new(500.0, 5000.0);
+        let mut runner = PathRunner::new();
+        runner
+            .start(
+                &[line_shape(0.0, 10.0), line_shape(20.0, 30.0)],
+                0.0,
+                0.01,
+                &TravelLimits::default(),
+                true,
+            )
+            .unwrap();
+
+        // wp0 (0,0) is already reached, so the first command is the leg
+        // tracing the first shape.
+        runner.tick(&mut hub);
+        assert!(hub.laser_on(), "tracing the first shape must fire");
+
+        while hub.is_moving() {
+            hub.sim.step(1.0 / 240.0);
+        }
+        runner.tick(&mut hub); // travel: (10,0) → (20,0)
+        assert!(
+            !hub.laser_on(),
+            "the transition between shapes must be dark"
+        );
+
+        while hub.is_moving() {
+            hub.sim.step(1.0 / 240.0);
+        }
+        runner.tick(&mut hub); // trace: (20,0) → (30,0)
+        assert!(hub.laser_on(), "tracing the second shape must fire");
+
+        while hub.is_moving() {
+            hub.sim.step(1.0 / 240.0);
+        }
+        assert_eq!(
+            runner.tick(&mut hub),
+            Some(PathEvent::Finished { steps: 4 })
+        );
+        assert!(!hub.laser_on(), "the run ends with the beam off");
+    }
+
+    #[test]
+    fn operator_kill_survives_the_next_transition() {
+        let mut hub = MotionHub::new(500.0, 5000.0);
+        let mut runner = PathRunner::new();
+        runner
+            .start(
+                &[line_shape(0.0, 10.0), line_shape(20.0, 30.0)],
+                0.0,
+                0.01,
+                &TravelLimits::default(),
+                true,
+            )
+            .unwrap();
+
+        runner.tick(&mut hub);
+        assert!(hub.laser_on());
+        hub.set_laser(false).unwrap(); // operator kills the beam mid-shape
+
+        while hub.is_moving() {
+            hub.sim.step(1.0 / 240.0);
+        }
+        runner.tick(&mut hub); // travel leg — records the operator kill
+        while hub.is_moving() {
+            hub.sim.step(1.0 / 240.0);
+        }
+        runner.tick(&mut hub); // first exposing leg of shape 2
+        assert!(
+            !hub.laser_on(),
+            "the runner must not re-fire after an operator kill"
+        );
     }
 
     #[test]

@@ -15,6 +15,8 @@ use acadrust::{CadDocument, DxfError, DxfReader, EntityType, Handle, LwPolyline,
 
 use crate::core::geo::{Arc, Line, PathElement, Point, Shape};
 
+use super::affine::Affine;
+
 /// Absolute chord tolerance (mm) used when a curve has to be flattened.
 const FLATTEN_TOLERANCE: f64 = 0.01;
 /// Chord tolerance relative to the curve radius, so huge curves stay bounded.
@@ -661,102 +663,6 @@ fn arc_segments(sweep: f64, radius: f64) -> usize {
     (sweep.abs() / step)
         .ceil()
         .clamp(1.0, MAX_FLATTEN_SEGMENTS as f64) as usize
-}
-
-// ─── Placement ──────────────────────────────────────────────────────────────
-
-/// 2D affine map, `[a b tx; c d ty]`, applied to the XY plane of the source.
-#[derive(Clone, Copy, Debug)]
-struct Affine {
-    a: f64,
-    b: f64,
-    tx: f64,
-    c: f64,
-    d: f64,
-    ty: f64,
-}
-
-impl Affine {
-    const IDENTITY: Affine = Affine {
-        a: 1.0,
-        b: 0.0,
-        tx: 0.0,
-        c: 0.0,
-        d: 1.0,
-        ty: 0.0,
-    };
-
-    fn translation(tx: f64, ty: f64) -> Self {
-        Affine {
-            tx,
-            ty,
-            ..Affine::IDENTITY
-        }
-    }
-
-    fn scale(sx: f64, sy: f64) -> Self {
-        Affine {
-            a: sx,
-            d: sy,
-            ..Affine::IDENTITY
-        }
-    }
-
-    fn rotation(angle: f64) -> Self {
-        let (sin, cos) = angle.sin_cos();
-        Affine {
-            a: cos,
-            b: -sin,
-            c: sin,
-            d: cos,
-            ..Affine::IDENTITY
-        }
-    }
-
-    /// `self ∘ other` — `other` acts on the point first.
-    fn then(self, other: Self) -> Self {
-        Affine {
-            a: self.a * other.a + self.b * other.c,
-            b: self.a * other.b + self.b * other.d,
-            tx: self.a * other.tx + self.b * other.ty + self.tx,
-            c: self.c * other.a + self.d * other.c,
-            d: self.c * other.b + self.d * other.d,
-            ty: self.c * other.tx + self.d * other.ty + self.ty,
-        }
-    }
-
-    fn point(&self, v: Vector3) -> Point {
-        Point::new(
-            self.a * v.x + self.b * v.y + self.tx,
-            self.c * v.x + self.d * v.y + self.ty,
-        )
-    }
-
-    /// Rotation angle of the linear part; only meaningful when [`Self::similarity`]
-    /// reports a uniform scale.
-    fn angle(&self) -> f64 {
-        self.c.atan2(self.a)
-    }
-
-    /// Upper bound on how much the map can stretch a length.
-    fn stretch_bound(&self) -> f64 {
-        (self.a.abs() + self.b.abs()).max(self.c.abs() + self.d.abs())
-    }
-
-    /// Uniform scale and winding direction when the map keeps circles circular,
-    /// `None` when an arc would turn into an ellipse.
-    fn similarity(&self) -> Option<(f64, bool)> {
-        let column = self.a.hypot(self.c);
-        let row = self.b.hypot(self.d);
-        if column <= WELD_EPSILON || row <= WELD_EPSILON {
-            return None;
-        }
-        let dot = self.a * self.b + self.c * self.d;
-        if (column - row).abs() > 1e-9 * column.max(row) || dot.abs() > 1e-9 * column * row {
-            return None;
-        }
-        Some((column, self.a * self.d - self.b * self.c > 0.0))
-    }
 }
 
 #[cfg(test)]

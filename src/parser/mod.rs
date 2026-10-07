@@ -1,5 +1,6 @@
+mod affine;
 pub mod dxf;
-// pub mod gds;
+pub mod gds;
 
 use crate::core::geo::Shape;
 use std::path::Path;
@@ -36,7 +37,7 @@ pub fn parse_file(path: &Path) -> Result<Vec<Shape>, ParseError> {
 
     match ext.as_str() {
         "dxf" => Ok(dxf::parse(path)?),
-        "gds" => Err(ParseError::UnsupportedFormat(ext)),
+        "gds" => Ok(gds::parse(path)?),
         _ => Err(ParseError::UnsupportedFormat(ext)),
     }
 }
@@ -48,6 +49,9 @@ pub enum ParseError {
 
     #[error("DXF error: {0}")]
     Dxf(#[from] acadrust::DxfError),
+
+    #[error("GDS error: {0}")]
+    Gds(#[from] gds21::GdsError),
 
     #[error("UnsupportedFormat: {0}")]
     UnsupportedFormat(String),
@@ -62,6 +66,15 @@ mod tests {
         let path = Path::new("tests/data/example.dxf");
 
         let shapes = parse_file(path).expect("example.dxf should parse");
+
+        assert!(!shapes.is_empty());
+    }
+
+    #[test]
+    fn dispatches_gds_by_extension() {
+        let path = Path::new("tests/data/gds_example.gds");
+
+        let shapes = parse_file(path).expect("gds_example.gds should parse");
 
         assert!(!shapes.is_empty());
     }
