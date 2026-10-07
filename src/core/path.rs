@@ -3,6 +3,10 @@
 //! Geometry is flattened into a list of XY waypoints once, then [`PathRunner`]
 //! commands them one at a time through [`MotionHub`]: command the next point,
 //! wait until the stage is idle, skip the points it reached, repeat.
+//!
+//! Beam discipline: when started with `fire`, the laser is switched on with
+//! the first commanded waypoint and every way out of a run (finish, failure,
+//! [`PathRunner::stop`]) switches it back off.
 
 use std::time::{Duration, Instant};
 
@@ -35,6 +39,11 @@ pub struct PathRunner {
     commanded: bool,
     commanded_at: Option<Instant>,
     grace: Duration,
+    /// Fire the laser while the run is live.
+    fire: bool,
+    /// The beam has been armed for this run (set once, so an operator
+    /// switching it off mid-run keeps control).
+    armed: bool,
 }
 
 impl Default for PathRunner {
@@ -46,6 +55,8 @@ impl Default for PathRunner {
             commanded: false,
             commanded_at: None,
             grace: UNREACH_GRACE,
+            fire: false,
+            armed: false,
         }
     }
 }
@@ -67,12 +78,16 @@ impl PathRunner {
     /// Flatten `shapes` into waypoints on the plane at height `z` and begin
     /// following them. Returns the waypoint count. Refuses geometry outside
     /// `limits` so the user gets the full bounds report up front.
+    ///
+    /// `fire` arms the laser on the first commanded waypoint; every run end
+    /// switches the beam off again.
     pub fn start(
         &mut self,
         shapes: &[Shape],
         z: f64,
         tolerance: f64,
         limits: &TravelLimits,
+        fire: bool,
     ) -> Result<usize, String> {
         if shapes.is_empty() {
             return Err("no geometry loaded".to_string());
@@ -88,14 +103,22 @@ impl PathRunner {
         self.running = true;
         self.commanded = false;
         self.commanded_at = None;
+        self.fire = fire;
+        self.armed = false;
         Ok(steps)
     }
 
-    /// Halt the run where it stands (the stage keeps its current target).
-    pub fn stop(&mut self) {
+    /// Halt the run where it stands (the stage keeps its current target) and
+    /// switch the beam off. Taking the hub guarantees no run can end with the
+    /// laser left firing.
+    pub fn stop(&mut self, hub: &mut MotionHub) {
+        let was_running = self.running;
         self.running = false;
         self.commanded = false;
         self.commanded_at = None;
+        if was_running {
+            let _ = hub.set_laser(false);
+        }
     }
 
     /// Advance the run. Call once per frame while the stage ticks; returns an
@@ -121,7 +144,7 @@ impl PathRunner {
 
         if self.index >= self.waypoints.len() {
             let steps = self.waypoints.len();
-            self.stop();
+            self.stop(hub);
             return Some(PathEvent::Finished { steps });
         }
 
@@ -134,7 +157,7 @@ impl PathRunner {
             }
             let wp = self.waypoints[self.index];
             let lim = hub.sim.limits;
-            self.stop();
+            self.stop(hub);
             return Some(PathEvent::Failed(format!(
                 "waypoint {} ({}, {}) not reached — stage stopped short (limits x [{}, {}] y [{}, {}] mm)",
                 self.index,
@@ -148,6 +171,14 @@ impl PathRunner {
         }
 
         let wp = self.waypoints[self.index];
+        // Arm the beam before the stage starts moving (the stage is idle here).
+        if self.fire && !self.armed {
+            if let Err(e) = hub.set_laser(true) {
+                self.stop(hub);
+                return Some(PathEvent::Failed(format!("laser on failed: {e}")));
+            }
+            self.armed = true;
+        }
         match hub.move_to(wp) {
             Ok(()) => {
                 self.commanded = true;
@@ -155,7 +186,7 @@ impl PathRunner {
                 None
             }
             Err(e) => {
-                self.stop();
+                self.stop(hub);
                 Some(PathEvent::Failed(e))
             }
         }
@@ -257,7 +288,8 @@ mod tests {
                 &[line_shape(0.0, 10.0)],
                 0.0,
                 0.01,
-                &TravelLimits::default()
+                &TravelLimits::default(),
+                false,
             ),
             Ok(2)
         );
@@ -277,6 +309,7 @@ mod tests {
                 0.0,
                 0.01,
                 &TravelLimits::default(),
+                false,
             )
             .unwrap_err();
         assert!(!runner.is_running(), "must not start the run");
@@ -296,15 +329,19 @@ mod tests {
                 0.0,
                 0.01,
                 &TravelLimits::default(),
+                false,
             )
             .unwrap();
-        // Shrink the limits after starting so the stage stops short of wp 1.
+        // Pretend the beam was firing, then shrink the limits after starting
+        // so the stage stops short of wp 1.
+        hub.set_laser(true).unwrap();
         hub.sim.limits.max.x = 5.0;
 
         match run(runner, &mut hub, 100_000) {
             Some(PathEvent::Failed(msg)) => {
                 assert!(msg.contains("stopped short"), "{msg}");
                 assert!(msg.contains("limits"), "{msg}");
+                assert!(!hub.laser_on(), "a failed run must leave the beam off");
             }
             other => panic!("expected failure, got {other:?}"),
         }
@@ -315,14 +352,14 @@ mod tests {
         let mut runner = PathRunner::new();
         assert!(
             runner
-                .start(&[], 0.0, 0.01, &TravelLimits::default())
+                .start(&[], 0.0, 0.01, &TravelLimits::default(), false)
                 .is_err()
         );
         assert!(!runner.is_running());
     }
 
     #[test]
-    fn stop_halts_the_run() {
+    fn stop_halts_the_run_and_the_beam() {
         let mut hub = MotionHub::new(50.0, 500.0);
         let mut runner = PathRunner::new();
         runner
@@ -331,6 +368,7 @@ mod tests {
                 0.0,
                 0.01,
                 &TravelLimits::default(),
+                false,
             )
             .unwrap();
         for _ in 0..10 {
@@ -338,9 +376,63 @@ mod tests {
             hub.sim.step(1.0 / 240.0);
         }
         assert!(runner.is_running());
+        hub.set_laser(true).unwrap();
 
-        runner.stop();
+        runner.stop(&mut hub);
         assert!(!runner.is_running());
+        assert!(!hub.laser_on(), "stopping the run kills the beam");
         assert_eq!(runner.tick(&mut hub), None);
+    }
+
+    #[test]
+    fn fire_arms_the_beam_and_the_finish_kills_it() {
+        let mut hub = MotionHub::new(500.0, 5000.0);
+        let mut runner = PathRunner::new();
+        runner
+            .start(
+                &[line_shape(0.0, 10.0)],
+                0.0,
+                0.01,
+                &TravelLimits::default(),
+                true,
+            )
+            .unwrap();
+        assert!(!hub.laser_on(), "no beam before the first command");
+
+        runner.tick(&mut hub);
+        assert!(hub.laser_on(), "beam fires while the run is live");
+        hub.set_laser(false).unwrap(); // operator override mid-run
+        runner.tick(&mut hub);
+        hub.sim.step(1.0 / 240.0);
+        // Armed once: the runner must not re-fire behind the operator's back.
+        assert!(!hub.laser_on(), "operator override sticks");
+
+        let ev = run(runner, &mut hub, 100_000);
+        assert_eq!(ev, Some(PathEvent::Finished { steps: 2 }));
+        assert!(!hub.laser_on(), "beam dies when the run finishes");
+    }
+
+    #[test]
+    fn fire_without_a_link_fails_the_run_before_moving() {
+        let mut hub = MotionHub::new(500.0, 5000.0);
+        hub.mode = crate::core::motion::DriveMode::Hardware;
+        let mut runner = PathRunner::new();
+        runner
+            .start(
+                &[line_shape(0.0, 10.0)],
+                0.0,
+                0.01,
+                &TravelLimits::default(),
+                true,
+            )
+            .unwrap();
+
+        match runner.tick(&mut hub) {
+            Some(PathEvent::Failed(msg)) => {
+                assert!(msg.contains("laser on failed"), "{msg}");
+                assert!(!runner.is_running());
+            }
+            other => panic!("expected a laser failure, got {other:?}"),
+        }
     }
 }

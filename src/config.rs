@@ -62,6 +62,13 @@ pub struct LaserConfig {
     pub fade_time_ms: f64,
     /// Enable laser interlock check
     pub interlock_enabled: bool,
+    /// Fire the beam automatically while a path-follow run is active.
+    #[serde(default = "default_expose_on_follow")]
+    pub expose_on_follow: bool,
+}
+
+fn default_expose_on_follow() -> bool {
+    true
 }
 
 impl Default for LaserConfig {
@@ -74,6 +81,7 @@ impl Default for LaserConfig {
             min_pulse_us: 10.0,
             fade_time_ms: 5.0,
             interlock_enabled: true,
+            expose_on_follow: default_expose_on_follow(),
         }
     }
 }

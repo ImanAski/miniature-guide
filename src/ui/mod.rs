@@ -24,6 +24,19 @@ use crate::core::path::PathRunner;
 
 use buffer::LogBuffer;
 
+/// Colour used for the beam indicator anywhere in the UI.
+pub const LASER_COLOR: egui::Color32 = egui::Color32::from_rgb(235, 82, 82);
+
+/// Add `i` to the selection, or remove it when already present.
+pub fn toggle_selection(selection: &mut Vec<usize>, i: usize) {
+    match selection.iter().position(|&x| x == i) {
+        Some(pos) => {
+            selection.remove(pos);
+        }
+        None => selection.push(i),
+    }
+}
+
 /// Where a panel is placed. Ordering is derived, so a panel can move slots
 /// without touching the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -234,6 +247,15 @@ mod tests {
         assert!(reg.iter().any(|p| p.slot() == Slot::Center));
         assert!(reg.get_mut("motion").is_some());
         assert!(reg.get_mut("nope").is_none());
+    }
+
+    #[test]
+    fn toggle_selection_adds_then_removes() {
+        let mut sel = Vec::new();
+        toggle_selection(&mut sel, 3);
+        toggle_selection(&mut sel, 1);
+        toggle_selection(&mut sel, 3);
+        assert_eq!(sel, vec![1], "second toggle of 3 removes it");
     }
 
     #[test]

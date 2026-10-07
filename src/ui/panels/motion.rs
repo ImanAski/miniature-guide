@@ -12,7 +12,7 @@ use crate::app::AppStatus;
 use crate::core::geo::fmt_f;
 use crate::core::motion::{AXES, Axes, DriveMode};
 use crate::esp301::LinkConfig;
-use crate::ui::{Panel, PanelCtx, Slot};
+use crate::ui::{LASER_COLOR, Panel, PanelCtx, Slot};
 
 const PLOT_HEIGHT: f32 = 190.0;
 
@@ -75,6 +75,8 @@ impl Panel for MotionPanel {
     }
 
     fn show(&mut self, ui: &mut Ui, ctx: &mut PanelCtx<'_>) {
+        // Keep the beam pin in sync with the config (it can change any frame).
+        ctx.motion.laser_pin = ctx.config.laser.digital_output_pin;
         self.drive_section(ui, ctx);
         ui.add_space(6.0);
         self.readout_section(ui, ctx);
@@ -336,12 +338,45 @@ impl MotionPanel {
                 ctx.note(log::Level::Info, "motion", "simulator reset");
             }
         });
+        ui.horizontal(|ui| {
+            self.laser_button(ui, ctx);
+            ui.checkbox(&mut ctx.config.laser.expose_on_follow, "auto on follow")
+                .on_hover_text("fire the beam automatically while following a path");
+        });
+    }
+
+    /// Manual beam toggle: flips the digital output the config points at.
+    fn laser_button(&mut self, ui: &mut Ui, ctx: &mut PanelCtx<'_>) {
+        let on = ctx.motion.laser_on();
+        let can_fire = ctx.motion.mode == DriveMode::Simulated || ctx.motion.is_linked();
+        let text = if on {
+            RichText::new("● Laser ON").color(LASER_COLOR)
+        } else {
+            RichText::new("○ Laser OFF").weak()
+        };
+        let resp = ui
+            .add_enabled(can_fire, egui::Button::new(text))
+            .on_hover_text(format!(
+                "manual beam toggle — digital output {} from config",
+                ctx.config.laser.digital_output_pin
+            ))
+            .on_disabled_hover_text("connect the controller first");
+        if resp.clicked() {
+            match ctx.motion.set_laser(!on) {
+                Ok(()) => ctx.note(
+                    log::Level::Info,
+                    "motion",
+                    if !on { "laser ON" } else { "laser OFF" },
+                ),
+                Err(e) => ctx.note(log::Level::Error, "motion", format!("laser: {e}")),
+            }
+        }
     }
 
     /// Abort an active path-follow run, e.g. when the operator takes over.
     fn cancel_follow(&mut self, ctx: &mut PanelCtx<'_>) {
         if ctx.runner.is_running() {
-            ctx.runner.stop();
+            ctx.runner.stop(ctx.motion);
             *ctx.status = AppStatus::Ready;
             ctx.note(log::Level::Info, "motion", "path follow stopped");
         }
@@ -374,9 +409,11 @@ impl MotionPanel {
         }
 
         let pos = ctx.motion.pos();
+        let laser_on = ctx.motion.laser_on();
         let cur = project(view, rect, pos.x, pos.y);
-        painter.circle_filled(cur, 4.0, accent);
-        painter.circle_stroke(cur, 8.0, Stroke::new(1.0_f32, accent));
+        let marker = if laser_on { LASER_COLOR } else { accent };
+        painter.circle_filled(cur, 4.0, marker);
+        painter.circle_stroke(cur, 8.0, Stroke::new(1.0_f32, marker));
 
         let target = ctx.motion.target();
         let tp = project(view, rect, target.x, target.y);
@@ -396,6 +433,23 @@ impl MotionPanel {
             ),
             egui::TextStyle::Small.resolve(ui.style()),
             ui.visuals().text_color(),
+        );
+
+        // Beam state, top-right corner of the plot.
+        painter.text(
+            rect.right_top() + vec2(-6.0, 4.0),
+            egui::Align2::RIGHT_TOP,
+            if laser_on {
+                "● LASER"
+            } else {
+                "○ laser off"
+            },
+            egui::TextStyle::Small.resolve(ui.style()),
+            if laser_on {
+                LASER_COLOR
+            } else {
+                ui.visuals().weak_text_color()
+            },
         );
 
         if resp.clicked()

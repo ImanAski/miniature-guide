@@ -4,7 +4,7 @@ use egui::{RichText, Ui};
 
 use crate::core::geo::fmt_f;
 use crate::core::motion::DriveMode;
-use crate::ui::{Panel, PanelCtx, Slot};
+use crate::ui::{LASER_COLOR, Panel, PanelCtx, Slot};
 
 #[derive(Debug, Default)]
 pub struct StatusPanel;
@@ -75,6 +75,9 @@ impl Panel for StatusPanel {
                     ui.colored_label(ui.visuals().error_fg_color, err);
                 }
                 ui.separator();
+                if ctx.motion.laser_on() {
+                    ui.colored_label(LASER_COLOR, "● laser");
+                }
                 if !ctx.selection.is_empty() {
                     ui.label(
                         RichText::new(format!("{} selected", ctx.selection.len()))

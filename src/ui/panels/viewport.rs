@@ -4,10 +4,13 @@ use egui::{Color32, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::app::AppStatus;
 use crate::core::geo::{PathElement, Point, Rect, Shape, fmt_f};
-use crate::ui::{Panel, PanelCtx, Slot};
+use crate::ui::{Panel, PanelCtx, Slot, toggle_selection};
 
 const MIN_ZOOM: f64 = 0.01;
 const MAX_ZOOM: f64 = 400.0;
+/// Click tolerance: how near (px) the pointer must be to a shape's geometry
+/// for it to count as a hit.
+const HIT_PX: f64 = 6.0;
 
 pub struct ViewportPanel {
     /// World point held at the canvas centre (mm).
@@ -179,7 +182,7 @@ impl ViewportPanel {
             let (done, total) = ctx.runner.progress();
             ui.label(RichText::new(format!("follow {done}/{total}")).small());
             if ui.button("Stop path").clicked() {
-                ctx.runner.stop();
+                ctx.runner.stop(ctx.motion);
                 *ctx.status = AppStatus::Ready;
                 ctx.note(log::Level::Info, "viewport", "path follow stopped");
             }
@@ -199,6 +202,7 @@ impl ViewportPanel {
         let z = ctx.motion.pos().z;
         let tolerance = ctx.config.processing.approximation_tolerance;
         let limits = ctx.motion.sim.limits;
+        let fire = ctx.config.laser.expose_on_follow;
         // Hidden layers are not exposed by the machine.
         let visible: Vec<Shape> = ctx
             .shapes
@@ -206,13 +210,14 @@ impl ViewportPanel {
             .filter(|s| !is_hidden(s, ctx))
             .cloned()
             .collect();
-        match ctx.runner.start(&visible, z, tolerance, &limits) {
+        match ctx.runner.start(&visible, z, tolerance, &limits, fire) {
             Ok(steps) => {
                 *ctx.status = AppStatus::Running;
+                let beam = if fire { ", beam armed" } else { "" };
                 ctx.note(
                     log::Level::Info,
                     "viewport",
-                    format!("path follow started ({steps} waypoints)"),
+                    format!("path follow started ({steps} waypoints{beam})"),
                 );
             }
             Err(e) => ctx.note(log::Level::Error, "viewport", format!("path follow: {e}")),
@@ -260,11 +265,13 @@ impl ViewportPanel {
             && let Some(pos) = resp.interact_pointer_pos()
         {
             let world = self.to_world(pos, rect);
-            let hit = pick(ctx.shapes, ctx, world);
+            let tolerance = ctx.config.processing.approximation_tolerance.max(1e-4);
+            let world_tol = HIT_PX / self.zoom.max(1e-9);
+            let hit = pick(ctx.shapes, ctx, world, tolerance, world_tol);
             let additive = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl);
             if additive {
                 if let Some(i) = hit {
-                    toggle(ctx.selection, i);
+                    toggle_selection(ctx.selection, i);
                 }
             } else {
                 ctx.selection.clear();
@@ -391,26 +398,67 @@ fn is_hidden(shape: &Shape, ctx: &PanelCtx<'_>) -> bool {
         .is_some_and(|l| ctx.hidden_layers.contains(l))
 }
 
-fn toggle(selection: &mut Vec<usize>, i: usize) {
-    match selection.iter().position(|&x| x == i) {
-        Some(pos) => {
-            selection.remove(pos);
-        }
-        None => selection.push(i),
-    }
-}
-
 fn ctx_repaint(ui: &egui::Ui) {
     ui.ctx().request_repaint();
 }
 
-fn pick(shapes: &[Shape], ctx: &PanelCtx<'_>, world: Point) -> Option<usize> {
-    shapes
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| !is_hidden(s, ctx) && s.bounds().is_some_and(|b| b.contains(world)))
-        .map(|(i, _)| i)
-        .next_back()
+/// Pick the shape nearest the click: the pointer must lie within `world_tol`
+/// of the shape's actual geometry (not just its bounding box), so thin lines
+/// and arcs are selectable and overlapping shapes resolve by proximity.
+/// Ties go to the topmost (last-drawn) shape.
+fn pick(
+    shapes: &[Shape],
+    ctx: &PanelCtx<'_>,
+    world: Point,
+    tolerance: f64,
+    world_tol: f64,
+) -> Option<usize> {
+    let mut best: Option<(usize, f64)> = None;
+    for (i, shape) in shapes.iter().enumerate() {
+        if is_hidden(shape, ctx) {
+            continue;
+        }
+        // Cheap reject: only shapes whose (expanded) bounds contain the point
+        // can be within tolerance of their geometry.
+        if let Some(b) = shape.bounds() {
+            let inside = world.x >= b.min.x - world_tol
+                && world.x <= b.max.x + world_tol
+                && world.y >= b.min.y - world_tol
+                && world.y <= b.max.y + world_tol;
+            if !inside {
+                continue;
+            }
+        }
+        let d = shape_distance(shape, world, tolerance);
+        if d <= world_tol && best.is_none_or(|(_, bd)| d <= bd) {
+            best = Some((i, d));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// Shortest distance from `p` to the shape's flattened outline (mm).
+fn shape_distance(shape: &Shape, p: Point, tolerance: f64) -> f64 {
+    let mut best = f64::INFINITY;
+    for polyline in polylines(shape, tolerance) {
+        for seg in polyline.windows(2) {
+            best = best.min(seg_dist(p, seg[0], seg[1]));
+        }
+    }
+    best
+}
+
+/// Distance from point `p` to segment `a → b`.
+fn seg_dist(p: Point, a: Point, b: Point) -> f64 {
+    let abx = b.x - a.x;
+    let aby = b.y - a.y;
+    let len2 = abx * abx + aby * aby;
+    if len2 <= f64::EPSILON {
+        return p.distance(a);
+    }
+    let t = (((p.x - a.x) * abx + (p.y - a.y) * aby) / len2).clamp(0.0, 1.0);
+    let proj = Point::new(a.x + t * abx, a.y + t * aby);
+    p.distance(proj)
 }
 
 fn polylines(shape: &Shape, tolerance: f64) -> Vec<Vec<Point>> {
@@ -455,4 +503,78 @@ fn demo_shapes() -> Vec<Shape> {
     }
     let plate = Shape::new(plate, true);
     vec![plate, circle]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::geo::{Arc, Line, PathElement};
+
+    fn hline(y: f64) -> Shape {
+        Shape::new(
+            vec![PathElement::Line(Line::new(
+                Point::new(0.0, y),
+                Point::new(10.0, y),
+            ))],
+            false,
+        )
+    }
+
+    #[test]
+    fn seg_dist_is_zero_on_the_line_and_exact_off_it() {
+        let a = Point::new(0.0, 0.0);
+        let b = Point::new(10.0, 0.0);
+        assert_eq!(seg_dist(Point::new(4.0, 0.0), a, b), 0.0);
+        assert_eq!(seg_dist(Point::new(4.0, 3.0), a, b), 3.0);
+        // Beyond the ends the distance is to the endpoint.
+        assert_eq!(seg_dist(Point::new(13.0, 4.0), a, b), 5.0);
+        assert_eq!(seg_dist(Point::new(-3.0, 4.0), a, b), 5.0);
+        // Degenerate segment behaves like a point.
+        assert_eq!(seg_dist(Point::new(3.0, 4.0), a, a), 5.0);
+    }
+
+    #[test]
+    fn shape_distance_ignores_bounding_boxes() {
+        // An L-shape: its bbox contains (10, 10), but the geometry does not.
+        let l = Shape::new(
+            vec![
+                PathElement::Line(Line::new(Point::new(0.0, 0.0), Point::new(10.0, 0.0))),
+                PathElement::Line(Line::new(Point::new(10.0, 0.0), Point::new(10.0, 10.0))),
+            ],
+            false,
+        );
+        let inside_bbox = Point::new(2.0, 8.0);
+        assert!(l.bounds().unwrap().contains(inside_bbox));
+        assert!(
+            shape_distance(&l, inside_bbox, 0.01) > 7.0,
+            "click far from both legs must be far from the geometry"
+        );
+        assert_eq!(shape_distance(&l, Point::new(5.0, 0.0), 0.01), 0.0);
+    }
+
+    #[test]
+    fn arcs_are_measured_on_their_curve() {
+        let circle = Shape::new(
+            vec![PathElement::Arc(Arc::full_circle(
+                Point::new(0.0, 0.0),
+                5.0,
+            ))],
+            true,
+        );
+        // On the rim: distance zero. At the centre: ~5 mm from the rim
+        // (chords of the flattened arc sit up to `tolerance` inside).
+        assert!(shape_distance(&circle, Point::new(5.0, 0.0), 0.01) < 1e-6);
+        let d = shape_distance(&circle, Point::ORIGIN, 0.01);
+        assert!((d - 5.0).abs() < 0.02, "centre distance {d}");
+    }
+
+    #[test]
+    fn thin_shapes_are_pickable_within_the_click_tolerance() {
+        let tolerance = 0.01;
+        let world_tol = 0.3; // ~6 px at 20 px/mm
+        // A single horizontal line and a click 0.2 mm above it: inside 0.3.
+        assert!(shape_distance(&hline(0.0), Point::new(5.0, 0.2), tolerance) <= world_tol);
+        // A click 0.5 mm away: outside.
+        assert!(shape_distance(&hline(0.0), Point::new(5.0, 0.5), tolerance) > world_tol);
+    }
 }

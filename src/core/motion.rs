@@ -360,6 +360,9 @@ pub struct MotionHub {
     pub trail_max: usize,
     pub poll_interval: Duration,
     pub link_error: Option<String>,
+    /// ESP301 digital-output pin wired to the laser (synced from config by the UI).
+    pub laser_pin: u8,
+    laser_on: bool,
     commanded: Axes,
     last_tick: Instant,
     last_poll: Instant,
@@ -379,6 +382,8 @@ impl MotionHub {
             trail_max: 4000,
             poll_interval: Duration::from_millis(200),
             link_error: None,
+            laser_pin: 1,
+            laser_on: false,
             commanded: Axes::ZERO,
             last_tick: now,
             last_poll: now,
@@ -497,6 +502,54 @@ impl MotionHub {
         }
     }
 
+    // ─── Laser ─────────────────────────────────────────────────────────
+
+    /// Current beam state. In hardware mode this mirrors the last command
+    /// accepted by the controller (the link is polled, not the DO pin).
+    pub fn laser_on(&self) -> bool {
+        self.laser_on
+    }
+
+    /// Switch the beam on or off. The simulator only records the state;
+    /// hardware sends `DO<pin>,<0|1>` on the ESP301 link. Returns `Ok(())`
+    /// without touching the link when the state is already correct.
+    pub fn set_laser(&mut self, on: bool) -> Result<(), String> {
+        if self.laser_on == on {
+            return Ok(());
+        }
+        match self.mode {
+            DriveMode::Simulated => {
+                self.laser_on = on;
+                log::info!("laser: {}", beam_word(on));
+                Ok(())
+            }
+            DriveMode::Hardware => {
+                let link = self.link.as_mut().ok_or("controller not connected")?;
+                let pin = self.laser_pin;
+                link.set_digital_out(pin, on).map_err(|e| e.to_string())?;
+                self.laser_on = on;
+                log::info!("laser: {} (DO{pin})", beam_word(on));
+                Ok(())
+            }
+        }
+    }
+
+    /// Best-effort switch-off for safety paths; never fails. In hardware
+    /// mode the command is sent even if the flag already reads off, so the
+    /// controller ends up in a known state.
+    fn beam_off(&mut self) {
+        if self.mode == DriveMode::Hardware
+            && let Some(link) = self.link.as_mut()
+        {
+            let pin = self.laser_pin;
+            let _ = link.set_digital_out(pin, false);
+        }
+        if self.laser_on {
+            self.laser_on = false;
+            log::info!("laser: OFF");
+        }
+    }
+
     pub fn connect(&mut self, cfg: &LinkConfig) -> Result<(), String> {
         let driver = SerialDriver::open(cfg).map_err(|e| e.to_string())?;
         let name = cfg.port.clone();
@@ -505,11 +558,15 @@ impl MotionHub {
         self.commanded = Axes::new(self.status.pos_x, self.status.pos_y, self.status.pos_z);
         self.last_poll = Instant::now() - self.poll_interval;
         self.mode = DriveMode::Hardware;
+        // Start from a known beam state: whatever the pin was doing, it is now off.
+        self.beam_off();
         log::info!("motion: connected to {name}");
         Ok(())
     }
 
     pub fn disconnect(&mut self) {
+        // Switch the beam off while the link is still open.
+        self.beam_off();
         if let Some(mut link) = self.link.take() {
             let _ = link.stop();
         }
@@ -558,7 +615,7 @@ impl MotionHub {
     }
 
     pub fn stop(&mut self, ramped: bool) -> Result<(), String> {
-        match self.mode {
+        let res = match self.mode {
             DriveMode::Simulated => {
                 if ramped {
                     self.sim.stop_ramped();
@@ -576,7 +633,10 @@ impl MotionHub {
                 }
                 .map_err(|e| e.to_string())
             }
-        }
+        };
+        // Stop always kills the beam, whatever the drive was doing.
+        self.beam_off();
+        res
     }
 
     pub fn home(&mut self, axes: &[usize]) -> Result<(), String> {
@@ -614,6 +674,10 @@ fn status_of(pos: Axes, moving: bool, homed: bool) -> ControllerStatus {
         buffer_count: 0,
         is_home: homed,
     }
+}
+
+fn beam_word(on: bool) -> &'static str {
+    if on { "ON" } else { "OFF" }
 }
 
 #[cfg(test)]
@@ -769,5 +833,39 @@ mod tests {
         assert!(hub.move_to(Axes::new(1.0, 2.0, 3.0)).is_err());
         assert!(hub.jog(0, 1.0, 1.0, 10.0).is_err());
         assert!(hub.stop(false).is_err());
+    }
+
+    #[test]
+    fn laser_toggles_in_simulation() {
+        let mut hub = MotionHub::new(30.0, 400.0);
+        assert!(!hub.laser_on());
+        hub.set_laser(true).unwrap();
+        assert!(hub.laser_on());
+        // Idempotent: a second "on" does not re-send.
+        hub.set_laser(true).unwrap();
+        assert!(hub.laser_on());
+        hub.set_laser(false).unwrap();
+        assert!(!hub.laser_on());
+    }
+
+    #[test]
+    fn stop_and_disconnect_kill_the_beam() {
+        let mut hub = MotionHub::new(30.0, 400.0);
+        hub.set_laser(true).unwrap();
+        hub.stop(true).unwrap();
+        assert!(!hub.laser_on(), "ramp stop must switch the beam off");
+
+        hub.set_laser(true).unwrap();
+        hub.disconnect();
+        assert!(!hub.laser_on(), "disconnect must switch the beam off");
+        assert_eq!(hub.mode, DriveMode::Simulated);
+    }
+
+    #[test]
+    fn hardware_laser_needs_a_link() {
+        let mut hub = MotionHub::new(30.0, 400.0);
+        hub.mode = DriveMode::Hardware;
+        assert!(hub.set_laser(true).is_err());
+        assert!(!hub.laser_on());
     }
 }

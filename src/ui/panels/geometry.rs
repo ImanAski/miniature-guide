@@ -1,19 +1,22 @@
 //! Geometry toolbox: hatching, boolean operators, shape transforms, layers.
 //!
-//! Operates on the shared selection (shift/ctrl-click in the viewport to
-//! build one). Boolean results replace their operands; hatch output is
-//! appended and selected so it can be removed with one Delete.
+//! Operates on the shared selection (shift/ctrl-click in the viewport, or
+//! pick individual shapes from the layer lists below, to build one). Boolean
+//! results replace their operands; hatch output is appended and selected so
+//! it can be removed with one Delete.
+
+use std::collections::HashSet;
 
 use egui::{ComboBox, DragValue, RichText, Slider, Ui};
 
 use crate::core::boolops::{BoolOp, boolean_op};
 use crate::core::edit::{
-    delete_layer, layer_counts, mirror_horizontal, mirror_vertical, rename_layer, rotate,
-    selection_center, set_layer, shapes_on_layer, translate,
+    delete_layer, mirror_horizontal, mirror_vertical, rename_layer, rotate, selection_center,
+    set_layer, translate,
 };
-use crate::core::geo::HatchPattern;
+use crate::core::geo::{HatchPattern, fmt_f};
 use crate::core::hatch::{HatchOptions, hatch};
-use crate::ui::{Panel, PanelCtx, Slot};
+use crate::ui::{Panel, PanelCtx, Slot, toggle_selection};
 
 /// Hatch pattern picker (mirrors [`HatchPattern`] without the embedded
 /// spacing/angle fields, which this panel edits separately).
@@ -45,6 +48,8 @@ pub struct GeometryPanel {
     layer_input: String,
     offset: [f64; 2],
     rotate_deg: f64,
+    /// Layers whose individual shape lists are expanded (`None` = unlayered).
+    expanded: HashSet<Option<String>>,
 }
 
 impl GeometryPanel {
@@ -56,6 +61,7 @@ impl GeometryPanel {
             layer_input: "hatch".to_string(),
             offset: [1.0, 1.0],
             rotate_deg: 90.0,
+            expanded: HashSet::new(),
         }
     }
 }
@@ -477,7 +483,17 @@ impl GeometryPanel {
             }
         });
 
-        for (name, count) in layer_counts(ctx.shapes) {
+        // Group shape indices per layer, first-seen order.
+        let mut groups: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+        for (i, s) in ctx.shapes.iter().enumerate() {
+            match groups.iter_mut().find(|(name, _)| *name == s.layer) {
+                Some((_, idxs)) => idxs.push(i),
+                None => groups.push((s.layer.clone(), vec![i])),
+            }
+        }
+
+        for (name, idxs) in groups {
+            let count = idxs.len();
             ui.horizontal(|ui| {
                 match &name {
                     Some(layer) => {
@@ -496,12 +512,21 @@ impl GeometryPanel {
                         ui.label(format!("(none) ({count})"));
                     }
                 }
+                let open = self.expanded.contains(&name);
+                if ui
+                    .small_button(if open { "▾" } else { "▸" })
+                    .on_hover_text("list the individual shapes on this layer")
+                    .clicked()
+                    && !self.expanded.remove(&name)
+                {
+                    self.expanded.insert(name.clone());
+                }
                 if ui
                     .small_button("Sel")
                     .on_hover_text("select every shape on this layer")
                     .clicked()
                 {
-                    *ctx.selection = shapes_on_layer(ctx.shapes, &name);
+                    *ctx.selection = idxs.clone();
                 }
                 if let Some(layer) = &name {
                     if ui
@@ -537,6 +562,41 @@ impl GeometryPanel {
                     }
                 }
             });
+
+            if self.expanded.contains(&name) {
+                let layer_hidden = name.as_ref().is_some_and(|l| ctx.hidden_layers.contains(l));
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("geometry.shapes.{name:?}"))
+                    .max_height(170.0)
+                    .show(ui, |ui| {
+                        for &i in &idxs {
+                            let Some(s) = ctx.shapes.get(i) else {
+                                continue;
+                            };
+                            let selected = ctx.selection.contains(&i);
+                            let desc = format!(
+                                "#{} · {} · {} mm",
+                                i,
+                                if s.closed { "closed" } else { "open" },
+                                fmt_f(s.total_length())
+                            );
+                            let text = if layer_hidden {
+                                RichText::new(desc).weak()
+                            } else {
+                                RichText::new(desc)
+                            };
+                            let resp = ui.selectable_label(selected, text);
+                            if resp.clicked() {
+                                let additive = ui.input(|m| m.modifiers.shift || m.modifiers.ctrl);
+                                if additive {
+                                    toggle_selection(ctx.selection, i);
+                                } else {
+                                    *ctx.selection = vec![i];
+                                }
+                            }
+                        }
+                    });
+            }
         }
     }
 }
