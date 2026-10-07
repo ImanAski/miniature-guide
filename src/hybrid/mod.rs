@@ -20,9 +20,7 @@ pub mod raster;
 pub mod segment;
 pub mod vector;
 
-pub use plan::{
-    Plan, TilePlan, diagnostics_csv, diagnostics_report, plan, svg_report,
-};
+pub use plan::{Plan, TilePlan, diagnostics_csv, diagnostics_report, plan, svg_report};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {

@@ -165,7 +165,11 @@ impl PlannerPanel {
             return;
         }
         let p = plan(&visible, &ctx.config.planner);
-        ctx.note(log::Level::Info, "planner", format!("plan: {}", p.summary()));
+        ctx.note(
+            log::Level::Info,
+            "planner",
+            format!("plan: {}", p.summary()),
+        );
         *ctx.plan = Some(p);
     }
 
@@ -193,11 +197,7 @@ impl PlannerPanel {
                 "planner",
                 format!("exported {}", path.display()),
             ),
-            Err(e) => ctx.note(
-                log::Level::Error,
-                "planner",
-                format!("export failed: {e}"),
-            ),
+            Err(e) => ctx.note(log::Level::Error, "planner", format!("export failed: {e}")),
         }
     }
 
@@ -250,20 +250,15 @@ impl PlannerPanel {
                     let sel = tp.selected();
                     ui.horizontal(|ui| {
                         ui.colored_label(mode_color(tp.mode), tp.mode.label());
-                        ui.label(
-                            RichText::new(format!("({tx},{ty})")).small().weak(),
-                        );
+                        ui.label(RichText::new(format!("({tx},{ty})")).small().weak());
                         ui.label(format!("{:.3} s", sel.write_time));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    RichText::new(format!("cost {:.2}", sel.cost))
-                                        .small()
-                                        .weak(),
-                                );
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("cost {:.2}", sel.cost))
+                                    .small()
+                                    .weak(),
+                            );
+                        });
                     });
                     if self.expanded {
                         egui::CollapsingHeader::new(

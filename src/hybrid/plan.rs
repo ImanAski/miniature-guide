@@ -9,7 +9,7 @@
 use crate::config::PlannerConfig;
 use crate::core::geo::{Point, Rect, Shape};
 use crate::hybrid::cost::{evaluate, select_from};
-use crate::hybrid::raster::{rasterize, RasterLine};
+use crate::hybrid::raster::{RasterLine, rasterize};
 use crate::hybrid::segment::partition_into_tiles;
 use crate::hybrid::vector::{
     Stroke, StrokeKind, order_strokes, serpentine_fill, strokes_to_shapes,
@@ -152,11 +152,7 @@ pub fn plan(shapes: &[Shape], cfg: &PlannerConfig) -> Plan {
 /// Vector mode traces contours plus an interior serpentine fill (a filled
 /// region must expose its whole area); raster mode sweeps scan lines; hybrid
 /// does both — contours first, then the sweep.
-fn toolpaths(
-    tile: &Tile,
-    mode: WriteMode,
-    cfg: &PlannerConfig,
-) -> (Vec<Stroke>, Vec<RasterLine>) {
+fn toolpaths(tile: &Tile, mode: WriteMode, cfg: &PlannerConfig) -> (Vec<Stroke>, Vec<RasterLine>) {
     use crate::hybrid::segment::split_bulk_narrow;
 
     let pitch = cfg.raster.pitch_mm.max(1e-9);
@@ -224,10 +220,7 @@ pub fn diagnostics_report(plan: &Plan) -> String {
     out.push_str(&format!(
         "Mode mix:       {v} vector / {r} raster / {h} hybrid\n"
     ));
-    out.push_str(&format!(
-        "Estimated time: {:.3} s\n",
-        plan.total_time
-    ));
+    out.push_str(&format!("Estimated time: {:.3} s\n", plan.total_time));
     out.push_str(&format!("Total cost:     {:.3}\n\n", plan.total_cost));
 
     for tp in &plan.tiles {
@@ -260,7 +253,11 @@ pub fn diagnostics_report(plan: &Plan) -> String {
                 ));
             }
         }
-        out.push_str(&format!("  decision: {} — {}\n\n", tp.mode.label(), tp.selected().reason));
+        out.push_str(&format!(
+            "  decision: {} — {}\n\n",
+            tp.mode.label(),
+            tp.selected().reason
+        ));
     }
     out
 }
@@ -488,7 +485,10 @@ mod tests {
 
     #[test]
     fn plan_is_deterministic() {
-        let shapes = vec![rect_shape(0.0, 0.0, 1.0, 1.0), rect_shape(3.0, 0.0, 4.0, 1.0)];
+        let shapes = vec![
+            rect_shape(0.0, 0.0, 1.0, 1.0),
+            rect_shape(3.0, 0.0, 4.0, 1.0),
+        ];
         let cfg = PlannerConfig::default();
         let a = plan(&shapes, &cfg);
         let b = plan(&shapes, &cfg);

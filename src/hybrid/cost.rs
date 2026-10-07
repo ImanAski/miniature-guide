@@ -22,10 +22,7 @@ fn clamp_speed(v: f64, maxv: f64) -> f64 {
 /// Vector fill pitch (mm): the tighter of the scan pitch and the beam spot —
 /// vector mode must expose the area just as densely as raster does.
 fn fill_pitch(cfg: &PlannerConfig) -> f64 {
-    cfg.raster
-        .pitch_mm
-        .min(cfg.beam.spot_size_mm)
-        .max(1e-9)
+    cfg.raster.pitch_mm.min(cfg.beam.spot_size_mm).max(1e-9)
 }
 
 /// Trapezoid (constant accel + cruise + decel) move time for distance d.
